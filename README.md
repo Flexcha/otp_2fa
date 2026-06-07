@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Hệ Thống Xác Thực 2 Lớp (2FA System)
 
 Dự án này là một hệ thống xác thực bảo mật đa lớp được xây dựng bằng Python, minh hoạ cách tích hợp phương thức xác thực hai bước (2FA) theo chuẩn TOTP (Time-Based One-Time Password) kết hợp với các cơ chế bảo mật nâng cao. Dự án này được thiết kế dựa trên một tài liệu đặc tả hệ thống chuẩn mực.
@@ -44,3 +45,7 @@ python auth_system.py
 - Hệ thống sử dụng SQLite (`auth.db` và `auth_web.db`) để dễ dàng demo. Khi lên thực tế, bạn có thể dễ dàng chuyển đổi sang PostgreSQL hay MySQL.
 - Ứng dụng hiện tại sử dụng hằng số `MASTER_KEY` mặc định. Ở môi trường triển khai thực tế, bạn **bắt buộc** phải thay đổi và truyền biến khóa mã hóa (Secret Key AES-256) qua biến môi trường (Environment Variable `APP_MASTER_KEY`).
 - Server Flask hiện tại chạy ở chế độ phát triển (Debug mode). Cần dùng một WSGI Server thực thụ như Gunicorn để chạy Producton.
+=======
+# otp_2fa
+btl an toàn bảo mật thông tin
+>>>>>>> 3f232bdd03ac2f3c07c2f9e9857595b71017bc0e
