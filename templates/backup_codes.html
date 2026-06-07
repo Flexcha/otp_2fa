@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block content %}
+    <h3 class="mb-3 text-center">Backup Codes</h3>
+    <div class="alert alert-info small text-center mb-4">
+        2FA is now enabled. Please save these codes securely. Each code works exactly once.
+    </div>
+    
+    <div class="row g-2 mb-4">
+        {% for code in codes %}
+            <div class="col-6">
+                <div class="backup-code text-primary">{{ code }}</div>
+            </div>
+        {% endfor %}
+    </div>
+    
+    <div class="d-grid">
+        <a href="{{ url_for('dashboard') }}" class="btn btn-primary">I have saved them</a>
+    </div>
+{% endblock %}

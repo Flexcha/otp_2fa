@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block content %}
+    <h3 class="mb-2 text-center">Create Account</h3>
+    <p class="text-muted text-center mb-4">Join our secure platform today.</p>
+    
+    <form method="POST" id="registerForm">
+        <div class="mb-3">
+            <label class="form-label">Email Address <span class="text-muted small">(Optional)</span></label>
+            <input type="email" name="email" class="form-control" placeholder="name@example.com">
+        </div>
+
+        <div class="mb-3">
+            <label class="form-label">Username</label>
+            <input type="text" name="username" class="form-control" placeholder="Choose a username" required>
+        </div>
+        
+        <div class="mb-3">
+            <label class="form-label">Password</label>
+            <input type="password" name="password" id="password" class="form-control" placeholder="Create a password" required>
+        </div>
+
+        <div class="mb-4">
+            <label class="form-label">Confirm Password</label>
+            <input type="password" id="confirm_password" class="form-control" placeholder="Confirm your password" required>
+            <div class="invalid-feedback">
+                Passwords do not match.
+            </div>
+        </div>
+
+        <button type="submit" class="btn btn-primary w-100 py-2">Create Account</button>
+    </form>
+    
+    <div class="text-center mt-4">
+        <span class="text-muted small">Already have an account?</span> <a href="{{ url_for('login') }}" class="text-decoration-none fw-semibold small">Sign in</a>
+    </div>
+    
+    <script>
+        document.getElementById('registerForm').addEventListener('submit', function(e) {
+            var pwd = document.getElementById('password').value;
+            var cpwd = document.getElementById('confirm_password').value;
+            var cpwdInput = document.getElementById('confirm_password');
+            if (pwd !== cpwd) {
+                e.preventDefault();
+                cpwdInput.classList.add('is-invalid');
+            } else {
+                cpwdInput.classList.remove('is-invalid');
+            }
+        });
+    </script>
+{% endblock %}

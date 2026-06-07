@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block content %}
+    <h3 class="mb-4">Dashboard</h3>
+    <p>Welcome back, <strong>{{ session.username }}</strong>!</p>
+    
+    <div class="alert {% if is_2fa_enabled %}alert-success{% else %}alert-secondary{% endif %} mb-4" role="alert">
+        <div class="d-flex align-items-center">
+            <div class="me-2">
+                {% if is_2fa_enabled %}
+                    <span class="fs-4">✅</span>
+                {% else %}
+                    <span class="fs-4">⚠️</span>
+                {% endif %}
+            </div>
+            <div>
+                <strong>2FA Status:</strong><br>
+                {% if is_2fa_enabled %}
+                    Your account is secure.
+                {% else %}
+                    Not enabled. We recommend securing your account.
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <div class="d-grid gap-2">
+        {% if not is_2fa_enabled %}
+            <a href="{{ url_for('setup_2fa') }}" class="btn btn-primary">Enable 2FA Now</a>
+        {% endif %}
+        <a href="{{ url_for('logout') }}" class="btn btn-outline-secondary">Sign Out</a>
+    </div>
+{% endblock %}
