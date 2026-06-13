@@ -1,4 +1,6 @@
 import os
+import logging
+import math
 import time
 import sqlite3
 import bcrypt
@@ -23,13 +25,29 @@ MAX_FAILED_ATTEMPTS = 3
 LOCKOUT_TIME = 60
 TIME_STEP = 30
 
+# --- OTP Rate Limiting (Brute-force Protection) ---
+OTP_MAX_ATTEMPTS = 5          # Số lần thử OTP sai tối đa trước khi khóa
+OTP_LOCKOUT_SCHEDULE = [5, 10, 15, 20, 30]  # Thời gian khóa theo lần (giây): lần 1=5s, lần 2=10s, ...
+OTP_ATTEMPT_WINDOW = 300      # Cửa sổ thời gian đếm số lần thử (5 phút)
+
+# --- Security Logger ---
+security_logger = logging.getLogger('security')
+security_logger.setLevel(logging.WARNING)
+log_handler = logging.FileHandler('security_events.log')
+log_handler.setFormatter(logging.Formatter(
+    '%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+security_logger.addHandler(log_handler)
+
 # --- Database & Crypto Utilities ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
-        failed_attempts INTEGER DEFAULT 0, lockout_until REAL DEFAULT 0, is_2fa_enabled BOOLEAN DEFAULT 0)''')
+        failed_attempts INTEGER DEFAULT 0, lockout_until REAL DEFAULT 0, login_lockout_count INTEGER DEFAULT 0,
+        is_2fa_enabled BOOLEAN DEFAULT 0)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS otp_secrets (
         user_id INTEGER PRIMARY KEY, encrypted_secret BLOB NOT NULL, nonce BLOB NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id))''')
@@ -38,6 +56,22 @@ def init_db():
         FOREIGN KEY(user_id) REFERENCES users(id))''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS used_otps (
         user_id INTEGER, otp TEXT, timestamp REAL, PRIMARY KEY(user_id, otp))''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS otp_rate_limits (
+        user_id INTEGER PRIMARY KEY,
+        otp_failed_attempts INTEGER DEFAULT 0,
+        otp_lockout_until REAL DEFAULT 0,
+        lockout_count INTEGER DEFAULT 0,
+        first_attempt_at REAL DEFAULT 0,
+        last_attempt_at REAL DEFAULT 0,
+        FOREIGN KEY(user_id) REFERENCES users(id))''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS security_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        event_type TEXT NOT NULL,
+        ip_address TEXT,
+        details TEXT,
+        created_at REAL DEFAULT (strftime('%%s','now')),
+        FOREIGN KEY(user_id) REFERENCES users(id))''')
     conn.commit()
     conn.close()
 
@@ -66,6 +100,100 @@ def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
+
+# --- OTP Rate Limiting Helpers ---
+def get_otp_rate_limit(conn, user_id):
+    """Lấy thông tin rate limit OTP của user, tự tạo nếu chưa có."""
+    row = conn.execute("SELECT * FROM otp_rate_limits WHERE user_id = ?", (user_id,)).fetchone()
+    if not row:
+        conn.execute("INSERT INTO otp_rate_limits (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        row = conn.execute("SELECT * FROM otp_rate_limits WHERE user_id = ?", (user_id,)).fetchone()
+    return row
+
+def check_otp_rate_limit(conn, user_id):
+    """Kiểm tra xem user có đang bị khóa OTP không. Trả về (is_locked, remaining_seconds)."""
+    rl = get_otp_rate_limit(conn, user_id)
+    current_time = time.time()
+    
+    if current_time < rl['otp_lockout_until']:
+        remaining = int(rl['otp_lockout_until'] - current_time)
+        return True, remaining
+    
+    # Auto-reset nếu cửa sổ thời gian đã hết (không có lần thử nào trong OTP_ATTEMPT_WINDOW)
+    if rl['otp_failed_attempts'] > 0 and (current_time - rl['last_attempt_at']) > OTP_ATTEMPT_WINDOW:
+        conn.execute("""UPDATE otp_rate_limits 
+                        SET otp_failed_attempts = 0, first_attempt_at = 0, last_attempt_at = 0 
+                        WHERE user_id = ?""", (user_id,))
+        conn.commit()
+    
+    return False, 0
+
+def record_otp_failed_attempt(conn, user_id, ip_address):
+    """Ghi nhận 1 lần thử OTP sai. Trả về (is_now_locked, lockout_seconds, attempt_count)."""
+    rl = get_otp_rate_limit(conn, user_id)
+    current_time = time.time()
+    
+    failed = rl['otp_failed_attempts'] + 1
+    first_at = rl['first_attempt_at'] if rl['first_attempt_at'] > 0 else current_time
+    
+    # Ghi vào security log
+    conn.execute(
+        "INSERT INTO security_logs (user_id, event_type, ip_address, details) VALUES (?, ?, ?, ?)",
+        (user_id, 'OTP_FAILED', ip_address, f'Attempt {failed}/{OTP_MAX_ATTEMPTS}')
+    )
+    security_logger.warning(f"OTP_FAILED | user_id={user_id} | ip={ip_address} | attempt={failed}/{OTP_MAX_ATTEMPTS}")
+    
+    if failed >= OTP_MAX_ATTEMPTS:
+        # Tính thời gian khóa theo bảng cố định (5s, 10s, 15s, 20s, 30s)
+        lockout_count = rl['lockout_count'] + 1
+        schedule_index = min(lockout_count - 1, len(OTP_LOCKOUT_SCHEDULE) - 1)
+        lockout_seconds = OTP_LOCKOUT_SCHEDULE[schedule_index]
+        lockout_until = current_time + lockout_seconds
+        
+        conn.execute("""UPDATE otp_rate_limits 
+                        SET otp_failed_attempts = 0, otp_lockout_until = ?, lockout_count = ?,
+                            first_attempt_at = 0, last_attempt_at = ? 
+                        WHERE user_id = ?""",
+                     (lockout_until, lockout_count, current_time, user_id))
+        conn.commit()
+        
+        # Ghi log cảnh báo nghiêm trọng
+        conn.execute(
+            "INSERT INTO security_logs (user_id, event_type, ip_address, details) VALUES (?, ?, ?, ?)",
+            (user_id, 'OTP_LOCKOUT', ip_address,
+             f'Account locked for {lockout_seconds}s (lockout #{lockout_count})')
+        )
+        security_logger.critical(
+            f"OTP_LOCKOUT | user_id={user_id} | ip={ip_address} | "
+            f"locked={lockout_seconds}s | lockout_count={lockout_count} | "
+            f"ALERT: Possible brute-force attack!"
+        )
+        conn.commit()
+        
+        return True, int(lockout_seconds), failed
+    else:
+        conn.execute("""UPDATE otp_rate_limits 
+                        SET otp_failed_attempts = ?, first_attempt_at = ?, last_attempt_at = ? 
+                        WHERE user_id = ?""",
+                     (failed, first_at, current_time, user_id))
+        conn.commit()
+        return False, 0, failed
+
+def reset_otp_rate_limit(conn, user_id):
+    """Reset toàn bộ rate limit khi xác thực OTP thành công."""
+    conn.execute("""UPDATE otp_rate_limits 
+                    SET otp_failed_attempts = 0, otp_lockout_until = 0, lockout_count = 0,
+                        first_attempt_at = 0, last_attempt_at = 0 
+                    WHERE user_id = ?""", (user_id,))
+
+def log_security_event(conn, user_id, event_type, ip_address, details):
+    """Ghi sự kiện bảo mật vào DB và file log."""
+    conn.execute(
+        "INSERT INTO security_logs (user_id, event_type, ip_address, details) VALUES (?, ?, ?, ?)",
+        (user_id, event_type, ip_address, details)
+    )
+    security_logger.info(f"{event_type} | user_id={user_id} | ip={ip_address} | {details}")
 
 # --- Routes ---
 @app.route('/')
@@ -106,6 +234,7 @@ def login():
     if request.method == 'POST':
         username = request.form['username'].strip()
         password = request.form['password']
+        ip_address = request.remote_addr
         
         conn = get_db_connection()
         user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
@@ -116,25 +245,56 @@ def login():
             return redirect(url_for('login'))
             
         current_time = time.time()
+        
+        # Kiểm tra lockout
         if current_time < user['lockout_until']:
-            flash(f"Account locked. Try again in {int(user['lockout_until'] - current_time)}s.", "error")
+            remaining = int(user['lockout_until'] - current_time)
+            flash(f"Account locked. Try again in {remaining}s.", "error")
             conn.close()
             return redirect(url_for('login'))
             
         if not verify_password(password, user['password_hash']):
             failed = user['failed_attempts'] + 1
+            
+            # Ghi security log
+            conn.execute(
+                "INSERT INTO security_logs (user_id, event_type, ip_address, details) VALUES (?, ?, ?, ?)",
+                (user['id'], 'LOGIN_FAILED', ip_address, f'Attempt {failed}/{MAX_FAILED_ATTEMPTS}')
+            )
+            security_logger.warning(f"LOGIN_FAILED | user_id={user['id']} | ip={ip_address} | attempt={failed}/{MAX_FAILED_ATTEMPTS}")
+            
             if failed >= MAX_FAILED_ATTEMPTS:
-                conn.execute("UPDATE users SET failed_attempts = ?, lockout_until = ? WHERE id = ?", 
-                             (failed, current_time + LOCKOUT_TIME, user['id']))
-                flash(f"Too many failed attempts. Account locked for {LOCKOUT_TIME}s.", "error")
+                # Tính lockout theo bảng cố định (5s, 10s, 15s, 20s, 30s)
+                lockout_count = (user['login_lockout_count'] or 0) + 1
+                schedule_index = min(lockout_count - 1, len(OTP_LOCKOUT_SCHEDULE) - 1)
+                lockout_seconds = OTP_LOCKOUT_SCHEDULE[schedule_index]
+                lockout_until = current_time + lockout_seconds
+                
+                conn.execute("UPDATE users SET failed_attempts = 0, lockout_until = ?, login_lockout_count = ? WHERE id = ?", 
+                             (lockout_until, lockout_count, user['id']))
+                
+                conn.execute(
+                    "INSERT INTO security_logs (user_id, event_type, ip_address, details) VALUES (?, ?, ?, ?)",
+                    (user['id'], 'LOGIN_LOCKOUT', ip_address, f'Account locked for {lockout_seconds}s (lockout #{lockout_count})')
+                )
+                security_logger.critical(
+                    f"LOGIN_LOCKOUT | user_id={user['id']} | ip={ip_address} | "
+                    f"locked={lockout_seconds}s | lockout_count={lockout_count} | "
+                    f"ALERT: Possible brute-force attack!"
+                )
+                
+                flash(f"Too many failed attempts. Account locked for {lockout_seconds}s.", "error")
             else:
                 conn.execute("UPDATE users SET failed_attempts = ? WHERE id = ?", (failed, user['id']))
-                flash("Invalid username or password.", "error")
+                remaining_attempts = MAX_FAILED_ATTEMPTS - failed
+                flash(f"Invalid username or password. {remaining_attempts} attempt(s) remaining.", "error")
             conn.commit()
             conn.close()
             return redirect(url_for('login'))
             
-        conn.execute("UPDATE users SET failed_attempts = 0, lockout_until = 0 WHERE id = ?", (user['id'],))
+        # Đăng nhập thành công -> reset
+        conn.execute("UPDATE users SET failed_attempts = 0, lockout_until = 0, login_lockout_count = 0 WHERE id = ?", (user['id'],))
+        log_security_event(conn, user['id'], 'LOGIN_SUCCESS', ip_address, 'Password verified successfully')
         conn.commit()
         conn.close()
         
@@ -158,14 +318,26 @@ def login_2fa():
     
     if request.method == 'POST':
         otp_input = request.form['otp'].strip()
+        ip_address = request.remote_addr
         conn = get_db_connection()
         
-        # Check Backup Code
+        # === BƯỚC 1: Kiểm tra Rate Limit (chống Brute-force) ===
+        is_locked, remaining = check_otp_rate_limit(conn, user_id)
+        if is_locked:
+            flash(f"Too many failed OTP attempts. Please try again in {remaining}s.", "error")
+            conn.close()
+            session.pop('pending_2fa_user_id', None)
+            session.pop('pending_username', None)
+            return redirect(url_for('login'))
+        
+        # === BƯỚC 2: Kiểm tra Backup Code (mã dự phòng) ===
         if len(otp_input) == 8:
             backup_codes = conn.execute("SELECT id, code_hash FROM backup_codes WHERE user_id = ? AND is_used = 0", (user_id,)).fetchall()
             for row in backup_codes:
                 if verify_password(otp_input, row['code_hash']):
                     conn.execute("UPDATE backup_codes SET is_used = 1 WHERE id = ?", (row['id'],))
+                    reset_otp_rate_limit(conn, user_id)
+                    log_security_event(conn, user_id, 'BACKUP_CODE_USED', ip_address, 'Login via backup code')
                     conn.commit()
                     conn.close()
                     
@@ -173,11 +345,22 @@ def login_2fa():
                     session['username'] = session.pop('pending_username')
                     session.pop('pending_2fa_user_id')
                     return redirect(url_for('dashboard'))
-            flash("Invalid or already used backup code.", "error")
-            conn.close()
-            return redirect(url_for('login_2fa'))
             
-        # Check TOTP
+            # Backup code sai -> ghi nhận lần thử thất bại
+            is_locked, lockout_secs, attempts = record_otp_failed_attempt(conn, user_id, ip_address)
+            conn.close()
+            if is_locked:
+                flash(f"Too many failed attempts. Account locked for {lockout_secs}s.", "error")
+                session.pop('pending_2fa_user_id', None)
+                session.pop('pending_username', None)
+                return redirect(url_for('login'))
+            else:
+                rl = get_otp_rate_limit(get_db_connection(), user_id)
+                remaining_attempts = OTP_MAX_ATTEMPTS - rl['otp_failed_attempts']
+                flash(f"Invalid backup code. {remaining_attempts} attempt(s) remaining.", "error")
+                return redirect(url_for('login_2fa'))
+            
+        # === BƯỚC 3: Kiểm tra TOTP ===
         current_time = time.time()
         if conn.execute("SELECT timestamp FROM used_otps WHERE user_id = ? AND otp = ?", (user_id, otp_input)).fetchone():
             flash("This OTP has already been used. Please wait for a new one.", "error")
@@ -194,8 +377,11 @@ def login_2fa():
         totp = pyotp.TOTP(secret)
         
         if totp.verify(otp_input, valid_window=1):
+            # OTP đúng -> reset rate limit + ghi log thành công
             conn.execute("DELETE FROM used_otps WHERE timestamp < ?", (current_time - TIME_STEP * 2,))
             conn.execute("INSERT INTO used_otps (user_id, otp, timestamp) VALUES (?, ?, ?)", (user_id, otp_input, current_time))
+            reset_otp_rate_limit(conn, user_id)
+            log_security_event(conn, user_id, 'OTP_SUCCESS', ip_address, 'OTP verified successfully')
             conn.commit()
             conn.close()
             
@@ -204,11 +390,31 @@ def login_2fa():
             session.pop('pending_2fa_user_id')
             return redirect(url_for('dashboard'))
         else:
-            flash("Invalid or expired authentication code.", "error")
+            # OTP sai -> ghi nhận lần thử thất bại với exponential backoff
+            is_locked, lockout_secs, attempts = record_otp_failed_attempt(conn, user_id, ip_address)
             conn.close()
-            return redirect(url_for('login_2fa'))
+            if is_locked:
+                flash(f"Too many failed attempts. Account locked for {lockout_secs}s.", "error")
+                session.pop('pending_2fa_user_id', None)
+                session.pop('pending_username', None)
+                return redirect(url_for('login'))
+            else:
+                rl = get_otp_rate_limit(get_db_connection(), user_id)
+                remaining_attempts = OTP_MAX_ATTEMPTS - rl['otp_failed_attempts']
+                flash(f"Invalid OTP code. {remaining_attempts} attempt(s) remaining.", "error")
+                return redirect(url_for('login_2fa'))
             
-    return render_template("login_2fa.html")
+    # GET request: hiển thị thông tin rate limit nếu có
+    conn = get_db_connection()
+    is_locked, remaining = check_otp_rate_limit(conn, user_id)
+    rl = get_otp_rate_limit(conn, user_id)
+    conn.close()
+    
+    return render_template("login_2fa.html", 
+                           is_locked=is_locked, 
+                           remaining_seconds=remaining,
+                           failed_attempts=rl['otp_failed_attempts'],
+                           max_attempts=OTP_MAX_ATTEMPTS)
 
 @app.route('/resend-otp', methods=['POST'])
 def resend_otp():
@@ -298,6 +504,30 @@ def show_backup_codes():
         
     codes = session.pop('backup_codes')
     return render_template("backup_codes.html", codes=codes)
+
+@app.route('/disable-2fa', methods=['POST'])
+def disable_2fa():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+        
+    user_id = session['user_id']
+    
+    conn = get_db_connection()
+    user = conn.execute("SELECT is_2fa_enabled FROM users WHERE id = ?", (user_id,)).fetchone()
+    
+    if not user['is_2fa_enabled']:
+        conn.close()
+        flash("2FA is not enabled.", "error")
+        return redirect(url_for('dashboard'))
+        
+    conn.execute("UPDATE users SET is_2fa_enabled = 0 WHERE id = ?", (user_id,))
+    conn.execute("DELETE FROM otp_secrets WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM backup_codes WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    
+    flash("2FA has been successfully disabled.", "success")
+    return redirect(url_for('dashboard'))
 
 @app.route('/logout')
 def logout():

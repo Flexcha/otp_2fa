@@ -178,6 +178,36 @@ def setup_2fa(username):
     finally:
         conn.close()
 
+def disable_2fa(username):
+    print("\n--- HỦY BẢO MẬT 2FA ---")
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id, is_2fa_enabled FROM users WHERE username = ?", (username,))
+        user = cursor.fetchone()
+        if not user:
+            print("[-] Người dùng không tồn tại!")
+            return False
+        
+        user_id, is_2fa_enabled = user
+        if not is_2fa_enabled:
+            print("[-] Tài khoản chưa kích hoạt 2FA!")
+            return False
+
+        confirm = input("Bạn có chắc chắn muốn hủy 2FA không? (y/n): ")
+        if confirm.lower() == 'y':
+            cursor.execute("UPDATE users SET is_2fa_enabled = 0 WHERE id = ?", (user_id,))
+            cursor.execute("DELETE FROM otp_secrets WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM backup_codes WHERE user_id = ?", (user_id,))
+            conn.commit()
+            print("[+] Hủy 2FA thành công!")
+            return True
+        else:
+            print("[-] Đã hủy thao tác.")
+            return False
+    finally:
+        conn.close()
+
 def login():
     print("\n--- ĐĂNG NHẬP ---")
     username = input("Tên đăng nhập: ")
@@ -295,11 +325,14 @@ def main():
                 while True:
                     print(f"\n>> TRANG QUẢN TRỊ (Xin chào {user}) <<")
                     print("1. Cài đặt 2FA")
-                    print("2. Đăng xuất")
+                    print("2. Hủy 2FA")
+                    print("3. Đăng xuất")
                     sub_choice = input("Lựa chọn của bạn: ")
                     if sub_choice == '1':
                         setup_2fa(user)
                     elif sub_choice == '2':
+                        disable_2fa(user)
+                    elif sub_choice == '3':
                         print("[+] Đã đăng xuất.")
                         break
                     else:
